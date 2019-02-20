@@ -1,0 +1,441 @@
+
+Pics: Embedded from Getty Images.
+
+<a id='3p7-rJW7SbpJIoXahpTU7A' class='gie-single' href='http://www.gettyimages.co.uk/detail/3329921' target='_blank' style='color:#a7a7a7;text-decoration:none;font-weight:normal !important;border:none;display:inline-block;'>Embed from Getty Images</a><script>window.gie=window.gie||function(c){(gie.q=gie.q||[]).push(c)};gie(function(){gie.widgets.load({id:'3p7-rJW7SbpJIoXahpTU7A',sig:'Kv4qpQn1byVqXwTqAP6DGt6Zdbe3G5MUwRlC7nSgdj4=',w:'594px',h:'466px',items:'3329921',caption: true ,tld:'co.uk',is360: false })});</script><script src='//embed-cdn.gettyimages.com/widgets.js' charset='utf-8' async></script>
+
+<div class="getty embed image" style="background-color:#fff;display:inline-block;font-family:Roboto,sans-serif;color:#a7a7a7;font-size:11px;width:100%;max-width:594px;"><div style="padding:0;margin:0;text-align:left;"><a href="http://www.gettyimages.co.uk/detail/3329921" target="_blank" style="color:#a7a7a7;text-decoration:none;font-weight:normal !important;border:none;display:inline-block;">Embed from Getty Images</a></div><div style="overflow:hidden;position:relative;height:0;padding:78.45118% 0 0 0;width:100%;"><iframe src="//embed.gettyimages.com/embed/3329921?et=3p7-rJW7SbpJIoXahpTU7A&tld=co.uk&sig=Kv4qpQn1byVqXwTqAP6DGt6Zdbe3G5MUwRlC7nSgdj4=&caption=true&ver=1" scrolling="no" frameborder="0" width="594" height="466" style="display:inline-block;position:absolute;top:0;left:0;width:100%;height:100%;margin:0;"></iframe></div></div>
+
+
+== Getting Kwaaaay Afloat with Podman and systemd
+
+Red Hat Quay, or Kwaaaay as my US colleagues pronounce it, is a Container Registry originally from the guys at CoreOS, who were recently purchased by Red Hat. A container registry plays a pivotal role in a successful container strategy, making it simple for developers and administrators to store, manage, distribute and deploy container images across their container platforms, be that on a laptop, standalone server or a distributed solution like Kubernetes.
+
+Quay has a number of additional features that make it an ideal choice within Enterprises. These include high availability, geo-replication, auditing, authentication and team based collaboration.
+
+Podman is a new CLI tool that enables users to run standalone OCI containers, similar to the Docker CLI. However, unlike Docker, Podman doesn't require a daemon to pull, push, inspect or run containers, making it a lighter weight solution and simpler to integrate into systemd for system services.
+
+Red Hat Quay exclusively ships as a container image, with the default documentation advising the use of Docker as the runtime. This works great, however I've been wanting an excuse to get to grips with Podman and attempt to use it to run system services, and this seemed the ideal opportunity.
+
+=== Pre-Reqs
+
+OK, so I'll presume you have an up-to-date and registered RHEL 7.6 host to start from. The Quay docs recommend 2vCPUs and 4GB RAM and some disk space. I'm using a t3.medium in AWS.
+
+Podman is in the RHEL Extras repository, so enable the repo and install using yum. The version as of writing is 0.12.1.2.
+
+$ sudo subscription-manager repos --enable="rhel-7-server-extras-rpms"
+$ sudo yum install podman
+
+=== Quay Architecture
+
+Quay is architecturally, very simple, with a core Quay service, a SQL database (PostgreSQL or MySQL) and Redis key-value store. Optionally, there is also the Clair security scanning tool, which we are installing and Quay builder images, which we are not. For this demo, we'll be using PostgreSQL for the database, as Clair requires a PostgreSQL database to store its data.
+
+Insert picy of arch here.
+
+=== Download the Container Images
+
+You need to have a CoreOS login to download Quay and Clair. Red Hat customers can retrieve a login by following the instructions in this article. https://access.redhat.com/solutions/3533201
+
+$ podman login -u="coreos+rhcp" -p="token-string" quay.io
+Login Succeeded!
+
+$ sudo podman pull quay.io/coreos/quay:v2.9.3
+$ sudo podman pull quay.io/coreos/clair-jwt:v2.0.1
+
+Quay and Clair require a valid PostgreSQL and Redis container image. Here I'm using official Red Hat images from the Red Hat registry.
+
+$ sudo podman pull registry.access.redhat.com/rhscl/postgresql-10-rhel7
+$ sudo podman pull registry.access.redhat.com/rhscl/redis-32-rhel7
+
+=== Prepare and Run the Container Images
+
+The Quay documentation focuses on using Docker to run these container images, so a bit of detective work is required to map everything into Podman so that it can be reliably ran using systemd. Importantly, the User the container image runs as, any Volumes that are required and basic Usage instructions need to be extracted.
+
+==== Examining PostgreSQL
+
+One advantage of using the RHSCL PostgreSQL image, is documentation :) https://access.redhat.com/documentation/en-us/red_hat_software_collections/3/html/using_red_hat_software_collections_container_images/database-images#postgresql
+
+Using `podman inspect` determine any embedded User, Volume and basic Usage information.
+
+$ sudo podman inspect registry.access.redhat.com/rhscl/postgresql-10-rhel7 | grep User
+            "User": "26",
+$ sudo podman inspect registry.access.redhat.com/rhscl/postgresql-10-rhel7 | grep -A2 Volumes
+            "Volumes": {
+                "/var/lib/pgsql/data": {}
+            },
+$ sudo podman inspect registry.access.redhat.com/rhscl/postgresql-10-rhel7 | grep usage
+            "usage": "docker run -d --name postgresql_database -e POSTGRESQL_USER=user -e POSTGRESQL_PASSWORD=pass -e POSTGRESQL_DATABASE=db -p 5432:5432 rhscl/postgresql-10-rhel7"
+
+We need a directory structure to help map any persistent data into our containers. I've chosen to create this within `/opt/containers/`, choose wherever you feel appropriate. In addition, we need to chown the dirs and update ACLs to the same UID/GID of that defined within the container (26).
+
+$ sudo mkdir -p /opt/containers/var/lib/pgsql/data
+$ sudo chown 26:26 /opt/containers/var/lib/pgsql/data
+$ sudo setfacl -m u:26:-wx /opt/containers/var/lib/pgsql/data
+
+Now lets create a systemd unit file, that will manage the PostgreSQL container. Note that in the example below, I'm setting the PostgreSQL user/password and database to those that I wish to create for use with Quay.
+
+./etc/systemd/system/postgresql-service.service
+[source]
+----
+[Unit]
+Description=PostgreSQL Podman Container for Quay
+After=network.target
+
+[Service]
+Type=simple
+TimeoutStartSec=5m
+ExecStartPre=-/usr/bin/podman rm "postgresql-service"
+
+ExecStart=/usr/bin/podman run --name postgresql-service -v /opt/containers/var/lib/pgsql/data:/var/lib/pgsql/data:Z -e POSTGRESQL_USER=quay -e POSTGRESQL_PASSWORD=quaysecret -e POSTGRESQL_ADMIN_PASSWORD=quayadmin -e POSTGRESQL_DATABASE=quay --net host registry.access.redhat.com/rhscl/postgresql-10-rhel7
+
+ExecReload=-/usr/bin/podman stop "postgresql-service"
+ExecReload=-/usr/bin/podman rm "postgresql-service"
+ExecStop=-/usr/bin/podman stop "postgresql-service"
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+----
+
+Finally we can reload the systemd daemon to see our unit file, and then start the PostgreSQL service.
+
+$ sudo systemctl daemon-reload
+$ sudo systemctl start postgresql-service
+$ sudo systemctl status postgresql-service
+● postgresql-service.service - Custom PostgreSQL Podman Container
+   Loaded: loaded (/etc/systemd/system/postgresql-service.service; disabled; vendor preset: disabled)
+   Active: active (running) since Mon 2019-01-21 17:33:10 UTC; 5s ago
+  Process: 21654 ExecStartPre=/usr/bin/podman rm postgresql-service (code=exited, status=125)
+ Main PID: 21675 (podman)
+   CGroup: /system.slice/postgresql-service.service
+           └─21675 /usr/bin/podman run --name postgresql-service -v /opt/containers/var/lib/pgsql/data:/var/lib/pgsql/data:Z -e POSTGRESQL_USER=quay -e POSTGRESQL_PASSWORD=qua...
+
+Cool :)
+
+Quay requires the TRGM Extension to be enabled within the PostgreSQL. The RHSCL image includes the extension, but it is not enabled by default, so lets enable it.
+
+$ sudo podman exec -it postgresql-service /bin/bash -c 'echo "SELECT * FROM pg_available_extensions" | /opt/rh/rh-postgresql10/root/usr/bin/psql'
+        name        | default_version | installed_version |                               comment
+--------------------+-----------------+-------------------+----------------------------------------------------------------------
+ adminpack          | 1.1             |                   | administrative functions for PostgreSQL
+
+$ sudo podman exec -it postgresql-service /bin/bash -c 'echo "CREATE EXTENSION pg_trgm" | /opt/rh/rh-postgresql10/root/usr/bin/psql'
+ CREATE EXTENSION
+
+$ sudo podman exec -it postgresql-service /bin/bash -c 'echo "SELECT * FROM pg_extension" | /opt/rh/rh-postgresql10/root/usr/bin/psql'
+  extname | extowner | extnamespace | extrelocatable | extversion | extconfig | extcondition
+ ---------+----------+--------------+----------------+------------+-----------+--------------
+  plpgsql |       10 |           11 | f              | 1.0        |           |
+  pg_trgm |       10 |         2200 | t              | 1.3        |           |
+ (2 rows)
+
+
+
+NOTE: Do we need to do this bit?
+
+OK, lets make the `quay` user we defined in our unit file, a SUPERUSER.
+
+$ sudo podman exec -it postgresql-service /bin/bash -c 'echo "ALTER USER quay WITH SUPERUSER;" | /opt/rh/rh-postgresql10/root/usr/bin/psql'
+ALTER ROLE
+
+And finally, we need to allow access to PostgreSQL via the firewall.
+
+$ sudo firewall-cmd --permanent --zone=trusted --add-port=5432/tcp
+$ sudo firewall-cmd --zone=public --add-service=postgresql
+$ sudo firewall-cmd --reload
+
+Rinse and repeat for the other images (Redis, Quay and Clair), to decipher and create the appropriate filesystem paths, systemd unit files and any other configs.
+
+.Container Image Configs
+[width="100%",cols="<20%,<20%,<20%,<20%,<20%",options="header",]
+|======
+|Image |User |Volumes |Usage |Port/Service
+
+|registry.access.redhat.com/rhscl/redis-32-rhel7
+|1001
+|/var/lib/redis/data
+|docker run -d --name redis_database -p 6379:6379 rhscl/redis-32-rhel7
+|6379/redis
+
+|quay.io/coreos/quay:v2.9.3
+|Not defined (root)
+|`/conf/stack`, `/datastorage`
+|Not defined
+|80/http, 443/https
+
+|quay.io/coreos/clair-jwt:v2.0.1
+|Not defined (root)
+|`/config`
+|Not defined
+|6060,6061
+
+|======
+
+Using the above, the following resources were created.
+
+==== Redis
+
+.Filesystems
+$ sudo mkdir -p /opt/containers/var/lib/redis/data
+$ sudo chown 1001:1001 /opt/containers/var/lib/redis/data
+$ sudo setfacl -m u:1001:-wx /opt/containers/var/lib/redis/data
+
+./etc/systemd/system/redis-service.service
+[source]
+----
+[Unit]
+Description=Redis Podman Container for Quay
+After=network.target
+
+[Service]
+Type=simple
+TimeoutStartSec=5m
+ExecStartPre=-/usr/bin/podman rm "redis-service"
+
+ExecStart=/usr/bin/podman run --name redis-service -v /opt/containers/var/lib/redis/data:/var/lib/redis/data:Z -e REDIS_PASSWORD=quaysecret --net host registry.access.redhat.com/rhscl/redis-32-rhel7
+
+ExecReload=-/usr/bin/podman stop "redis-service"
+ExecReload=-/usr/bin/podman rm "redis-service"
+ExecStop=-/usr/bin/podman stop "redis-service"
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+----
+
+.firewall rules
+$ sudo firewall-cmd --zone=public --add-service=redis
+
+==== Quay
+
+.Filesystems
+$ sudo mkdir -p /opt/containers/var/lib/quay/datastorage
+$ sudo mkdir -p /opt/containers/var/lib/quay/config
+$ sudo setfacl -m u:0:-wx /opt/containers/var/lib/quay/config
+$ sudo setfacl -m u:0:-wx /opt/containers/var/lib/quay/datastorage
+
+./etc/systemd/system/quay-service.service
+[source]
+----
+[Unit]
+Description=Quay Service Podman Container
+After=network.target
+
+[Service]
+Type=simple
+TimeoutStartSec=5m
+ExecStartPre=-/usr/bin/podman rm "quay-service"
+
+ExecStart=/usr/bin/podman run --name quay-service -v /opt/containers/var/lib/quay/datastorage:/datastorage:Z -v /opt/containers/var/lib/quay/config:/conf/stack:Z --net host quay.io/coreos/quay:v2.9.3
+
+ExecReload=-/usr/bin/podman stop "quay-service"
+ExecReload=-/usr/bin/podman rm "quay-service"
+ExecStop=-/usr/bin/podman stop "quay-service"
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+----
+
+==== Clair
+
+.Filesystems
+$ sudo mkdir -p /opt/containers/var/lib/clair/config
+$ sudo setfacl -m u:0:-wx /opt/containers/var/lib/clair/config
+
+./etc/systemd/system/clair-service.service
+[source]
+----
+[Unit]
+Description=Clair Service Podman Container
+After=network.target
+
+[Service]
+Type=simple
+TimeoutStartSec=5m
+ExecStartPre=-/usr/bin/podman rm "clair-service"
+
+ExecStart=/usr/bin/podman run --name clair-service -v /opt/containers/var/lib/clair/config:/config:Z --net host quay.io/coreos/clair-jwt:v2.0.1
+
+ExecReload=-/usr/bin/podman stop "clair-service"
+ExecReload=-/usr/bin/podman rm "clair-service"
+ExecStop=-/usr/bin/podman stop "clair-service"
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+----
+
+.Database
+
+Clair requires a PostgreSQL database. As we have a DB running for Quay, I'm using the same container to host the Clair DB too.
+
+DB: clairdb
+User: clair
+passwd: clairsecret
+
+$ sudo podman exec -it postgresql-service /bin/bash -c 'echo "CREATE DATABASE clairdb" | /opt/rh/rh-postgresql10/root/usr/bin/psql'
+$ sudo podman exec -it postgresql-service /bin/bash -c 'echo "CREATE USER clair WITH ENCRYPTED PASSWORD 'claisecret' " | /opt/rh/rh-postgresql10/root/usr/bin/psql'
+$ sudo podman exec -it postgresql-service /bin/bash -c 'echo "GRANT ALL PRIVILEGES ON DATABASE clairdb TO clair " | /opt/rh/rh-postgresql10/root/usr/bin/psql'
+
+bash-4.2$ /opt/rh/rh-postgresql10/root/bin/psql
+psql (10.6)
+Type "help" for help.
+postgres=# CREATE DATABASE clairdb;
+postgres=# CREATE USER clair WITH ENCRYPTED PASSWORD 'clairsecret';
+CREATE ROLE
+postgres=# GRANT ALL PRIVILEGES ON DATABASE clairdb TO clair;
+GRANT
+postgres=# ALTER DATABASE clairdb OWNER TO clair;
+ALTER DATABASE
+List of databases
+Name    |  Owner   | Encoding |  Collate   |   Ctype    |   Access privileges
+-----------+----------+----------+------------+------------+-----------------------
+clairdb   | clair    | UTF8     | en_US.utf8 | en_US.utf8 | =Tc/clair            +
+|          |          |            |            | clair=CTc/clair
+postgres  | postgres | UTF8     | en_US.utf8 | en_US.utf8 |
+quay      | quay     | UTF8     | en_US.utf8 | en_US.utf8 |
+template0 | postgres | UTF8     | en_US.utf8 | en_US.utf8 | =c/postgres          +
+|          |          |            |            | postgres=CTc/postgres
+template1 | postgres | UTF8     | en_US.utf8 | en_US.utf8 | =c/postgres          +
+|          |          |            |            | postgres=CTc/postgres
+(5 rows)
+
+
+
+{ POSTGRES_CONNECTION_STRING } == postgresql://postgres@localhost:5432/clairdb?sslmode=disable
+{ QUAY_ENDPOINT } == http://kwaaaay.spectre.portalvein.io
+{ CLAIR_ENDPOINT } == https://kwaaaay.spectre.portalvein.io:6060
+
+.Clair Config
+[source,yaml]
+----
+clair:
+  database:
+    type: pgsql
+    options:
+      # A PostgreSQL Connection string pointing to the Clair Postgres database.
+      # Documentation on the format can be found at: http://www.postgresql.org/docs/9.4/static/libpq-connect.html
+      source: postgresql://postgres@localhost:5432/clairdb?sslmode=disable
+      cachesize: 16384
+  api:
+    # The port at which Clair will report its health status. For example, if Clair is running at
+    # https://clair.mycompany.com, the health will be reported at
+    # http://clair.mycompany.com:6061/health.
+    healthport: 6061
+
+    port: 6062
+    timeout: 900s
+
+    # paginationkey can be any random set of characters. *Must be the same across all Clair instances*.
+    paginationkey:
+
+  updater:
+    # interval defines how often Clair will check for updates from its upstream vulnerability databases.
+    interval: 6h
+    notifier:
+      attempts: 3
+      renotifyinterval: 1h
+      http:
+        # QUAY_ENDPOINT defines the endpoint at which Quay Enterprise is running.
+        # For example: https://myregistry.mycompany.com
+        endpoint: http://kwaaaay.spectre.portalvein.io/secscan/notify
+        proxy: http://localhost:6063
+
+jwtproxy:
+  signer_proxy:
+    enabled: true
+    listen_addr: :6063
+    ca_key_file: /certificates/mitm.key # Generated internally, do not change.
+    ca_crt_file: /certificates/mitm.crt # Generated internally, do not change.
+    signer:
+      issuer: security_scanner
+      expiration_time: 5m
+      max_skew: 1m
+      nonce_length: 32
+      private_key:
+        type: autogenerated
+        options:
+          rotate_every: 12h
+          key_folder: /config/
+          key_server:
+            type: keyregistry
+            options:
+              # QUAY_ENDPOINT defines the endpoint at which Quay Enterprise is running.
+              # For example: https://myregistry.mycompany.com
+              registry: http://kwaaaay.spectre.portalvein.io/keys/
+
+
+  verifier_proxies:
+  - enabled: true
+    # The port at which Clair will listen.
+    listen_addr: :6060
+
+    # If Clair is to be served via TLS, uncomment these lines. See the "Running Clair under TLS"
+    # section below for more information.
+    # key_file: /config/clair.key
+    # crt_file: /config/clair.crt
+
+    verifier:
+      # CLAIR_ENDPOINT is the endpoint at which this Clair will be accessible. Note that the port
+      # specified here must match the listen_addr port a few lines above this.
+      # Example: https://myclair.mycompany.com:6060
+      audience: http://kwaaaay.spectre.portalvein.io:6060
+
+      upstream: http://localhost:6062
+      key_server:
+        type: keyregistry
+        options:
+          # QUAY_ENDPOINT defines the endpoint at which Quay Enterprise is running.
+          # Example: https://myregistry.mycompany.com
+          registry: http://kwaaaay.spectre.portalvein.io/keys/
+----
+
+.firewalld service
+
+./etc/firewalld/services/clair.xml
+[source,xml]
+----
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>clair</short>
+  <description>Firewalld service to allow access to Clair services.</description>
+  <port port="6060" protocol="tcp"/>
+  <port port="6061" protocol="tcp"/>
+  <port port="6062" protocol="tcp"/>
+  <port port="6063" protocol="tcp"/>
+</service>
+----
+
+===== Start Clair
+$ sudo systemctl start clair-service
+$ sudo systemctl status clair-service
+● clair-service.service - Clair Service Podman Container
+   Loaded: loaded (/etc/systemd/system/clair-service.service; disabled; vendor preset: disabled)
+   Active: active (running) since Tue 2019-02-19 01:02:54 UTC; 5s ago
+  Process: 27513 ExecStartPre=/usr/bin/podman rm clair-service (code=exited, status=125)
+ Main PID: 27533 (podman)
+   CGroup: /system.slice/clair-service.service
+           └─27533 /usr/bin/podman run --name clair-service -v /opt/containers/var/lib/clair/config:/config:Z --net host quay.io/coreos/clair-jwt:v2.0.1
+         podman[27533]: 2019-02-19 01:02:58,103 INFO success: jwtproxy entered RUNNING state, process has stayed up for > than 1 seconds (startsecs)
+         podman[27533]: 2019-02-19 01:02:58,104 INFO success: clair entered RUNNING state, process has stayed up for > than 1 seconds (startsecs)
+
+
+Once Clair is started, you just need to enable it in the Quay UI.
+
+Add snapshots of enabling Clair.
+
+
+==== Organisations/Namespaces
+
+Add a mimeograph user, create API object.
+Set up an Org for `rhel7`
+Create a Team
+Add mimeograph to the team
+
+Use mimeograph to sync from registry.access.redhat.com to Quay.
+
+See how Clair security scans the containers.
