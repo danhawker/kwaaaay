@@ -1,0 +1,19 @@
+[Unit]
+Description=Redis Podman Container for Quay
+After=network.target
+
+[Service]
+Type=simple
+TimeoutStartSec=5m
+ExecStartPre=-/usr/bin/podman rm "redis-service"
+
+ExecStart=/usr/bin/podman run --name redis-service -v /opt/containers/var/lib/redis/data:/var/lib/redis/data:Z -e REDIS_PASSWORD=quaysecret --net host registry.access.redhat.com/rhscl/redis-32-rhel7
+
+ExecReload=-/usr/bin/podman stop "redis-service"
+ExecReload=-/usr/bin/podman rm "redis-service"
+ExecStop=-/usr/bin/podman stop "redis-service"
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

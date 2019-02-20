@@ -1,0 +1,19 @@
+[Unit]
+Description=Clair Service Podman Container
+After=network.target
+
+[Service]
+Type=simple
+TimeoutStartSec=5m
+ExecStartPre=-/usr/bin/podman rm "clair-service"
+
+ExecStart=/usr/bin/podman run --name clair-service -v /opt/containers/var/lib/clair/config:/config:Z --net host quay.io/coreos/clair-jwt:v2.0.1
+
+ExecReload=-/usr/bin/podman stop "clair-service"
+ExecReload=-/usr/bin/podman rm "clair-service"
+ExecStop=-/usr/bin/podman stop "clair-service"
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

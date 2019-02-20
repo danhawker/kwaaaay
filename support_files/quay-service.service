@@ -1,0 +1,19 @@
+[Unit]
+Description=Quay Service Podman Container
+After=network.target
+
+[Service]
+Type=simple
+TimeoutStartSec=5m
+ExecStartPre=-/usr/bin/podman rm "quay-service"
+
+ExecStart=/usr/bin/podman run --name quay-service -v /opt/containers/var/lib/quay/datastorage:/datastorage:Z -v /opt/containers/var/lib/quay/config:/conf/stack:Z --net host quay.io/coreos/quay:v2.9.3
+
+ExecReload=-/usr/bin/podman stop "quay-service"
+ExecReload=-/usr/bin/podman rm "quay-service"
+ExecStop=-/usr/bin/podman stop "quay-service"
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
